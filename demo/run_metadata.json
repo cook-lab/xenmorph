@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "input_dir": "/Users/dpcook/Projects/xenmorph",
+  "out": "/Users/dpcook/Projects/xenmorph/demo/out.parquet",
+  "n_jobs": 1,
+  "rows": 0,
+  "columns": [
+    "cell_id",
+    "nucleus_area_um2",
+    "nucleus_perimeter_um",
+    "circularity",
+    "aspect_ratio",
+    "solidity",
+    "irregularity"
+  ],
+  "version": "0.1.0"
+}

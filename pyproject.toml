@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "xenmorph"
+version = "0.1.0"
+description = "Morphometrics for 10x Xenium segmentation (CLI built with Typer)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Your Name", email = "you@example.com" }]
+
+dependencies = [
+  "typer>=0.12",
+  "pandas>=2.0",
+  "numpy>=1.23",
+  "scipy>=1.10",
+  "shapely>=2.0",
+  "scikit-image>=0.22",
+  "pyarrow>=14.0",
+  "tqdm>=4.0",
+  "pyyaml>=6.0"
+]
+
+[project.urls]
+Homepage = "https://github.com/<YOUR_GH_USERNAME>/xenmorph"
+Issues = "https://github.com/<YOUR_GH_USERNAME>/xenmorph/issues"
+
+[project.scripts]
+xenmorph = "xenmorph.cli:app"
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "black", "pre-commit", "build", "twine"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.black]
+line-length = 100
+
