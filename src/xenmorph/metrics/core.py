@@ -1,41 +1,105 @@
-# =============================
-# xenmorph/metrics/core.py
-# =============================
 from __future__ import annotations
-import pandas as pd
+
+import warnings
+
 import numpy as np
+import pandas as pd
 from shapely.geometry import Polygon
 
 
 # ---- Metric helpers ----
+def _exterior_perimeter(g) -> float:
+    """Exterior-only perimeter for Polygon or MultiPolygon."""
+    gt = getattr(g, "geom_type", None)
+    if gt == "Polygon":
+        return float(g.exterior.length)
+    if gt == "MultiPolygon":
+        return float(sum(p.exterior.length for p in g.geoms))
+    # Fallback: total length
+    return float(g.length)
+
+
+def _count_holes(g) -> int:
+    """Total number of interior rings across Polygon(s)."""
+    gt = getattr(g, "geom_type", None)
+    if gt == "Polygon":
+        return len(getattr(g, "interiors", []))
+    if gt == "MultiPolygon":
+        return int(sum(len(getattr(p, "interiors", [])) for p in g.geoms))
+    return 0
 
 
 def _aspect_ratio_from_mrr(poly: Polygon) -> tuple[float, float, float]:
     """Return (aspect_ratio, elongation, mrr_area).
+
+    Robust to MultiPolygons by operating on the convex hull.
     aspect_ratio = min(w,h)/max(w,h) in (0,1]; elongation = 1/aspect_ratio.
     mrr_area is used for rectangularity.
     """
     try:
-        mrr = poly.minimum_rotated_rectangle
-    except Exception:  # Shapely functional form fallback
-        from shapely import minimum_rotated_rectangle
+        hull = poly.convex_hull  # handles Polygon or MultiPolygon
+        # Guard against degenerate hulls to avoid oriented_envelope warnings
+        if getattr(hull, "is_empty", False):
+            return float("nan"), float("nan"), float("nan")
+        if getattr(hull, "geom_type", "") != "Polygon":
+            return float("nan"), float("nan"), float("nan")
+        if getattr(hull, "area", 0.0) <= 0.0:
+            return float("nan"), float("nan"), float("nan")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+            mrr = hull.minimum_rotated_rectangle
+        coords = list(mrr.exterior.coords)[:-1]
+        if len(coords) < 4:
+            return float("nan"), float("nan"), float("nan")
 
-        mrr = minimum_rotated_rectangle(poly)
-    coords = list(mrr.exterior.coords)[:-1]
-    if len(coords) != 4:
+        # Edge lengths of the rectangle
+        def _dist(a, b):
+            return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+        edges = [_dist(coords[i], coords[(i + 1) % 4]) for i in range(4)]
+        w = min(edges)
+        h = max(edges)
+        if w <= 0 or h <= 0:
+            return float("nan"), float("nan"), float("nan")
+        ar = w / h
+        el = h / w
+        return ar, el, float(w * h)
+    except Exception:
         return float("nan"), float("nan"), float("nan")
 
-    def _dist(a, b):
-        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
 
-    lengths = [_dist(coords[i], coords[(i + 1) % 4]) for i in range(4)]
-    # Two unique side lengths (each appears twice)
-    w, h = sorted(lengths)[:2]
-    if w <= 0 or h <= 0:
-        return float("nan"), float("nan"), float("nan")
-    ar = min(w, h) / max(w, h)
-    el = max(w, h) / min(w, h)
-    return ar, el, float(w * h)
+def _convexity(g) -> float:
+    """Convexity ≤1 using exterior perimeters; robust for MultiPolygons.
+
+    For a Polygon: hull_perimeter / exterior_perimeter.
+    For a MultiPolygon: area-weighted mean of per-part convexities (each ≤1).
+    """
+    gt = getattr(g, "geom_type", None)
+    if gt == "Polygon":
+        per = float(g.exterior.length)
+        hull_ext = float(g.convex_hull.exterior.length)
+        return hull_ext / per if per > 0 else np.nan
+    if gt == "MultiPolygon":
+        parts = [p for p in g.geoms if p.area > 0]
+        if not parts:
+            return np.nan
+        vals, wts = [], []
+        for p in parts:
+            per = float(p.exterior.length)
+            hull_ext = float(p.convex_hull.exterior.length)
+            v = hull_ext / per if per > 0 else np.nan
+            if np.isfinite(v):
+                vals.append(v)
+                wts.append(p.area)
+        if not vals:
+            return np.nan
+        return float(
+            np.average(np.array(vals, dtype=float), weights=np.array(wts, dtype=float))
+        )
+    # Fallback (shouldn’t hit for proper polygonal types)
+    per = _exterior_perimeter(g)
+    hull_ext = float(g.convex_hull.exterior.length)
+    return hull_ext / per if per > 0 else np.nan
 
 
 def flag_touches_border(
@@ -109,13 +173,12 @@ def compute_metrics(
         ch = g.convex_hull
         ch_area = float(ch.area)
         soli[i] = a / ch_area if ch_area > 0 else np.nan
-        # Convexity (≤1): use exterior perimeters only
-        perim_ext = float(g.exterior.length)
-        hull_ext = float(ch.exterior.length)
-        conv[i] = hull_ext / perim_ext if perim_ext > 0 else np.nan
-        holes[i] = len(getattr(g, "interiors", [])) > 0
+        # Convexity (≤1), robust for MultiPolygons
+        conv[i] = _convexity(g)
+        hcount = _count_holes(g)
+        holes[i] = hcount > 0
         valid[i] = bool(g.is_valid)
-        n_holes[i] = len(getattr(g, "interiors", []))
+        n_holes[i] = hcount
         bnds[i, :] = g.bounds
 
     out = df[["object_id", "scope"]].copy()

@@ -7,7 +7,7 @@ import json
 import warnings
 import pandas as pd
 import numpy as np
-from typing import Literal, Tuple, Optional
+from typing import Literal, Optional
 
 try:
     from shapely.geometry import Polygon
@@ -23,28 +23,21 @@ _DEF_FILES = {
 }
 
 
-def _detect_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
-    """Return (id_col, x_col, y_col) for common Xenium boundary schemas.
-    Official docs: CSV has columns {cell_id|nucleus_id, vertex_x, vertex_y}.
-    Parquet mirrors those names; some tools rename id->id or object_id.
-    """
-    id_candidates = [
-        "nucleus_id",
-        "cell_id",
-        "id",
-        "object_id",
-    ]
+def _detect_columns_from_names(names: list[str]) -> tuple[str, str, str]:
+    id_candidates = ["nucleus_id", "cell_id", "id", "object_id"]
     x_candidates = ["vertex_x", "x", "coord_x"]
     y_candidates = ["vertex_y", "y", "coord_y"]
-
-    id_col = next((c for c in id_candidates if c in df.columns), None)
-    x_col = next((c for c in x_candidates if c in df.columns), None)
-    y_col = next((c for c in y_candidates if c in df.columns), None)
+    id_col = next((c for c in id_candidates if c in names), None)
+    x_col = next((c for c in x_candidates if c in names), None)
+    y_col = next((c for c in y_candidates if c in names), None)
     if not (id_col and x_col and y_col):
-        raise ValueError(
-            f"Could not detect required columns in boundaries: have {list(df.columns)[:10]}..."
-        )
+        raise ValueError(f"Could not detect id/x/y in {names[:10]}...")
     return id_col, x_col, y_col
+
+
+def _detect_columns(df: pd.DataFrame) -> tuple[str, str, str]:
+    """Wrapper that reuses the name-based detector on a DataFrame."""
+    return _detect_columns_from_names(list(df.columns))
 
 
 def read_boundaries(
@@ -53,40 +46,132 @@ def read_boundaries(
     parquet_path: Path | str | None = None,
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    """Load Xenium polygon boundaries for nuclei or cells.
+    """
+    Load Xenium polygon boundaries for nuclei or cells.
 
-    Returns a DataFrame with columns: [object_id, geometry, scope]. Coordinates are
-    in microns (per 10x docs).
+    Returns DataFrame: [object_id (str), geometry (Polygon/MultiPolygon), scope].
+    Uses a streaming path for large Parquets to keep memory stable.
     """
     base = Path(xenium_dir)
-    pq = Path(parquet_path) if parquet_path else base / _DEF_FILES[scope]
-    if not pq.exists():
-        raise FileNotFoundError(f"Missing boundaries Parquet: {pq}")
+    pq_path = Path(parquet_path) if parquet_path else base / _DEF_FILES[scope]
+    if not pq_path.exists():
+        raise FileNotFoundError(f"Missing boundaries Parquet: {pq_path}")
 
-    df = pd.read_parquet(pq, columns=columns)
-    id_col, x_col, y_col = _detect_columns(df)
+    # Try fast path with pandas for small/moderate files
+    try:
+        import pyarrow.parquet as pa_parquet  # only needed for streaming
 
-    # Ensure sorted by id and vertex order preserved as in file
-    df = df[[id_col, x_col, y_col]].copy()
-    df.rename(columns={id_col: "object_id", x_col: "x", y_col: "y"}, inplace=True)
+        pf = pa_parquet.ParquetFile(str(pq_path))
+        num_rows = pf.metadata.num_rows
+        names = getattr(pf.schema_arrow, "names", pf.schema.names)
+        id_col, x_col, y_col = _detect_columns_from_names(names)
+    except Exception:
+        # Fallback: pandas read (original behavior)
+        df = pd.read_parquet(pq_path, columns=columns)
+        id_col, x_col, y_col = _detect_columns(df)
+        df = (
+            df[[id_col, x_col, y_col]]
+            .copy()
+            .rename(columns={id_col: "object_id", x_col: "x", y_col: "y"})
+        )
+        geoms: list[Polygon] = []
+        ids: list[str] = []
+        for oid, g in df.groupby("object_id", sort=True):
+            arr = g[["x", "y"]].to_numpy(dtype=float)
+            if len(arr) >= 2 and np.allclose(arr[0], arr[-1]):
+                arr = arr[:-1]
+            if len(arr) < 3:
+                continue
+            poly = Polygon(arr)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or not poly.is_valid:
+                continue
+            geoms.append(poly)
+            ids.append(str(oid))
+        out = pd.DataFrame({"object_id": ids, "geometry": geoms})
+        out["scope"] = scope
+        return out
 
-    # Build polygons per object_id
+    # Decide whether to stream (threshold ~5M vertices)
+    STREAM_THRESHOLD = 5_000_000
+    if num_rows <= STREAM_THRESHOLD:
+        # small enough: use pandas for simplicity
+        df = pd.read_parquet(pq_path, columns=[id_col, x_col, y_col])
+        df = df.rename(columns={id_col: "object_id", x_col: "x", y_col: "y"})
+        geoms: list[Polygon] = []
+        ids: list[str] = []
+        for oid, g in df.groupby("object_id", sort=True):
+            arr = g[["x", "y"]].to_numpy(dtype=float)
+            if len(arr) >= 2 and np.allclose(arr[0], arr[-1]):
+                arr = arr[:-1]
+            if len(arr) < 3:
+                continue
+            poly = Polygon(arr)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_empty or not poly.is_valid:
+                continue
+            geoms.append(poly)
+            ids.append(str(oid))
+        out = pd.DataFrame({"object_id": ids, "geometry": geoms})
+        out["scope"] = scope
+        return out
+
+    # Streaming path: iterate record batches, finalize polygons when ID changes.
     geoms: list[Polygon] = []
-    ids: list[int] = []
-    for oid, g in df.groupby("object_id", sort=True):
-        arr = g[["x", "y"]].to_numpy(dtype=float)
-        # Drop duplicate closing vertex if present
+    ids: list[str] = []
+    seen_ids: set[str] = set()
+
+    cur_id: str | None = None
+    cur_pts: list[tuple[float, float]] = []
+
+    def _flush_current():
+        nonlocal cur_id, cur_pts
+        if cur_id is None or len(cur_pts) < 3:
+            cur_id, cur_pts = None, []
+            return
+        arr = np.asarray(cur_pts, dtype=float)
+        # drop duplicate close
         if len(arr) >= 2 and np.allclose(arr[0], arr[-1]):
             arr = arr[:-1]
-        if len(arr) < 3:
-            continue  # degenerate
-        poly = Polygon(arr)
-        if not poly.is_valid:
-            poly = poly.buffer(0)  # fix minor self-intersections
-        if poly.is_empty or not poly.is_valid:
-            continue
-        geoms.append(poly)
-        ids.append(int(oid))
+        if len(arr) >= 3:
+            poly = Polygon(arr)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.is_valid and (not poly.is_empty):
+                geoms.append(poly)
+                ids.append(cur_id)
+        cur_id, cur_pts = None, []
+
+    for batch in pf.iter_batches(columns=[id_col, x_col, y_col], batch_size=262_144):
+        # use batch.to_pandas() for simplicity; batch size keeps memory stable
+        bdf = batch.to_pandas()
+        for oid, x, y in zip(
+            bdf[id_col].astype(str), bdf[x_col].astype(float), bdf[y_col].astype(float)
+        ):
+            if cur_id is None:
+                cur_id = oid
+            if oid != cur_id:
+                # Finalize previous polygon
+                if cur_id in seen_ids:
+                    raise ValueError(
+                        "Boundaries Parquet is not grouped by object ID; "
+                        "streaming requires contiguous vertices per object."
+                    )
+                seen_ids.add(cur_id)
+                _flush_current()
+                cur_id = oid
+            cur_pts.append((x, y))
+
+    # Flush last
+    if cur_id is not None:
+        if cur_id in seen_ids:
+            raise ValueError(
+                "Boundaries Parquet is not grouped by object ID; "
+                "streaming requires contiguous vertices per object."
+            )
+        _flush_current()
 
     out = pd.DataFrame({"object_id": ids, "geometry": geoms})
     out["scope"] = scope
@@ -103,9 +188,17 @@ def read_cells_table(
     pqp = base / "cells.parquet"
     csv = base / "cells.csv.gz"
     if pqp.exists():
-        return pd.read_parquet(pqp, columns=columns)
+        df = pd.read_parquet(pqp)
+        if columns:
+            cols = [c for c in columns if c in df.columns]
+            return df[cols] if cols else df
+        return df
     if csv.exists():
-        return pd.read_csv(csv, usecols=columns)
+        df = pd.read_csv(csv)
+        if columns:
+            cols = [c for c in columns if c in df.columns]
+            return df[cols] if cols else df
+        return df
     return None
 
 

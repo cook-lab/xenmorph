@@ -1,17 +1,16 @@
-# =============================
-# xenmorph/cli/metrics_compute.py
-# =============================
 from __future__ import annotations
-import typer
+
 from pathlib import Path
-import pandas as pd
 from typing import List, Optional
 
+import pandas as pd
+import typer
+
 from xenmorph.io.xenium import (
-    read_boundaries,
-    read_cells_table,
     frame_from_extents,
     load_frame_um,
+    read_boundaries,
+    read_cells_table,
 )
 from xenmorph.metrics.core import compute_metrics
 
@@ -93,7 +92,7 @@ def compute(
 
     # Cells only or Nuclei only → tidy with clear id name and prefixes
     if scope in {"cells", "nuclei"}:
-        df = frames[0][1]
+        df = dict(frames)[scope]
         if scope == "cells":
             out = _prefix_columns(df, "cell_", "cell_id")
         else:
@@ -103,9 +102,7 @@ def compute(
         return
 
     # scope == both → wide per-cell table with canonical cell order when available
-    cells_tbl = read_cells_table(
-        xenium_dir, columns=["cell_id", "nucleus_id"]
-    )  # may be None
+    cells_tbl = read_cells_table(xenium_dir)  # may be None
 
     # Prefix metric columns and rename IDs
     cell_metrics = (
@@ -129,7 +126,7 @@ def compute(
         if nuc_metrics is not None and "nucleus_id" in out.columns:
             out = out.merge(nuc_metrics, on="nucleus_id", how="left")
         elif nuc_metrics is not None:
-            # No nucleus mapping column — assume 1:1 id equality and warn lightly
+            # No nucleus mapping column — assume 1:1 id equality
             out = out.merge(
                 nuc_metrics.rename(columns={"nucleus_id": "cell_id"}),
                 on="cell_id",
@@ -145,6 +142,11 @@ def compute(
             )
         else:
             out = cell_metrics or nuc_metrics
+
+    # In wide output, scope is redundant; drop any scope columns from merges
+    out = out.drop(
+        columns=[c for c in out.columns if c.startswith("scope")], errors="ignore"
+    )
 
     _write_table(out, out_path)
     typer.echo(f"Wrote {len(out)} rows → {out_path}")
